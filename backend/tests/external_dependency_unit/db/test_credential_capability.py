@@ -22,7 +22,9 @@ from onyx.connectors.capability_checks.models import (
 from onyx.db.credential_capability import (
     get_capability_report_row,
     get_capability_report_rows_for_source,
+    get_sources_with_running_capability_runs,
     mark_capability_report_running,
+    mark_stale_capability_runs_failed,
     upsert_completed_capability_report,
     upsert_completed_capability_report_unless_granular,
 )
@@ -36,10 +38,11 @@ def _report(
     connector_id: int | None = None,
     check_id: str = "slack_token_auth",
     is_fallback: bool = False,
+    source: DocumentSource = DocumentSource.SLACK,
 ) -> CredentialCapabilityReport:
     return CredentialCapabilityReport(
         credential_id=credential_id,
-        source=DocumentSource.SLACK,
+        source=source,
         connector_id=connector_id,
         checked_at=datetime.now(timezone.utc),
         trigger=CapabilityCheckTrigger.MANUAL,
@@ -284,6 +287,131 @@ def test_mark_running_replaces_a_stale_running_mark(db_session: Session) -> None
     assert remarked is not None
     assert remarked.run_started_at is not None
     assert remarked.run_started_at > stale_started_at
+
+
+@pytest.mark.usefixtures("tenant_context")
+def test_sweep_retires_only_stale_running_rows(db_session: Session) -> None:
+    """
+    Verifies the FAILED_TO_RUN writer: only RUNNING rows past the cutoff turn,
+    the stored report survives, and fresh or completed rows are untouched.
+
+    GITLAB rather than SLACK: committed rows from other suites never use it, so
+    the retired-row count is deterministic.
+    """
+    # Precondition. Three scopes: a stale run over a previous report, a fresh
+    # run, and a completed report.
+    stale_pair = make_cc_pair(db_session, source=DocumentSource.GITLAB, commit=False)
+    fresh_pair = make_cc_pair(db_session, source=DocumentSource.GITLAB, commit=False)
+    completed_pair = make_cc_pair(
+        db_session, source=DocumentSource.GITLAB, commit=False
+    )
+    upsert_completed_capability_report(
+        db_session,
+        credential_id=stale_pair.credential_id,
+        connector_id=None,
+        source=DocumentSource.GITLAB,
+        trigger=CapabilityCheckTrigger.MANUAL,
+        report=_report(
+            stale_pair.credential_id,
+            check_id="previous",
+            source=DocumentSource.GITLAB,
+        ),
+    )
+    for pair in (stale_pair, fresh_pair):
+        marked = mark_capability_report_running(
+            db_session,
+            credential_id=pair.credential_id,
+            connector_id=None,
+            source=DocumentSource.GITLAB,
+            trigger=CapabilityCheckTrigger.MANUAL,
+            active_within=timedelta(hours=1),
+        )
+        assert marked is not None
+    stale_row = get_capability_report_row(db_session, stale_pair.credential_id, None)
+    assert stale_row is not None
+    stale_row.run_started_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    db_session.flush()
+    upsert_completed_capability_report(
+        db_session,
+        credential_id=completed_pair.credential_id,
+        connector_id=None,
+        source=DocumentSource.GITLAB,
+        trigger=CapabilityCheckTrigger.MANUAL,
+        report=_report(completed_pair.credential_id, source=DocumentSource.GITLAB),
+    )
+
+    # Under test.
+    retired = mark_stale_capability_runs_failed(
+        db_session, source=DocumentSource.GITLAB, stale_after=timedelta(hours=1)
+    )
+
+    # Postcondition.
+    assert retired == 1
+    db_session.expire_all()
+    retired_row = get_capability_report_row(db_session, stale_pair.credential_id, None)
+    assert retired_row is not None
+    assert retired_row.run_status == CapabilityReportRunStatus.FAILED_TO_RUN
+    assert retired_row.report is not None
+    assert retired_row.report["check_results"][0]["check_id"] == "previous"
+    fresh_row = get_capability_report_row(db_session, fresh_pair.credential_id, None)
+    assert fresh_row is not None
+    assert fresh_row.run_status == CapabilityReportRunStatus.RUNNING
+    completed_row = get_capability_report_row(
+        db_session, completed_pair.credential_id, None
+    )
+    assert completed_row is not None
+    assert completed_row.run_status == CapabilityReportRunStatus.COMPLETED
+
+    # Under test and postcondition (a retired scope re-triggers immediately).
+    remarked = mark_capability_report_running(
+        db_session,
+        credential_id=stale_pair.credential_id,
+        connector_id=None,
+        source=DocumentSource.GITLAB,
+        trigger=CapabilityCheckTrigger.MANUAL,
+        active_within=timedelta(hours=1),
+    )
+    assert remarked is not None
+    assert remarked.run_status == CapabilityReportRunStatus.RUNNING
+
+
+@pytest.mark.usefixtures("tenant_context")
+def test_sources_with_running_runs_lists_each_source_once(
+    db_session: Session,
+) -> None:
+    """Verifies the sweep's work list: distinct sources with a RUNNING row."""
+    # Precondition. Two GITHUB scopes RUNNING, one GITLAB scope COMPLETED.
+    for pair in (
+        make_cc_pair(db_session, source=DocumentSource.GITHUB, commit=False),
+        make_cc_pair(db_session, source=DocumentSource.GITHUB, commit=False),
+    ):
+        marked = mark_capability_report_running(
+            db_session,
+            credential_id=pair.credential_id,
+            connector_id=None,
+            source=DocumentSource.GITHUB,
+            trigger=CapabilityCheckTrigger.MANUAL,
+            active_within=timedelta(hours=1),
+        )
+        assert marked is not None
+    completed_pair = make_cc_pair(
+        db_session, source=DocumentSource.GITLAB, commit=False
+    )
+    upsert_completed_capability_report(
+        db_session,
+        credential_id=completed_pair.credential_id,
+        connector_id=None,
+        source=DocumentSource.GITLAB,
+        trigger=CapabilityCheckTrigger.MANUAL,
+        report=_report(completed_pair.credential_id, source=DocumentSource.GITLAB),
+    )
+
+    # Under test.
+    sources = get_sources_with_running_capability_runs(db_session)
+
+    # Postcondition.
+    assert sources.count(DocumentSource.GITHUB) == 1
+    assert DocumentSource.GITLAB not in sources
 
 
 @pytest.mark.usefixtures("tenant_context")
